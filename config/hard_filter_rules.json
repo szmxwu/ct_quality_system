@@ -1,0 +1,82 @@
+{
+  "critical_organ_rules": {
+    "CHEST": {
+      "required": ["lung_upper_lobe_left", "lung_lower_lobe_left", "lung_upper_lobe_right", "lung_lower_lobe_right"],
+      "alternative_required": [
+        ["lung_upper_lobe_left", "lung_lower_lobe_left"],
+        ["lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right"]
+      ],
+      "description": "胸部扫描必须检测到双肺,可以是分叶或整体"
+    },
+    "ABDOMEN": {
+      "required": ["liver"],
+      "usually_present": ["spleen", "kidney_left", "kidney_right"],
+      "description": "腹部扫描必须检测到肝脏"
+    },
+    "PELVIS": {
+      "required": ["urinary_bladder"],
+      "description": "盆腔扫描必须检测到膀胱"
+    },
+    "CHEST_ABDOMEN": {
+      "required": ["liver"],
+      "alternative_required": [
+        ["lung_upper_lobe_left", "lung_lower_lobe_left"],
+        ["lung_upper_lobe_right", "lung_lower_lobe_right"]
+      ],
+      "description": "胸腹联合扫描"
+    }
+  },
+  
+  "cooccurrence_rules": [
+    {
+      "if_exists": "spleen",
+      "must_exist": ["liver"],
+      "reason": "有脾脏必有肝脏"
+    },
+    {
+      "if_exists": "gallbladder",
+      "must_exist": ["liver"],
+      "reason": "有胆囊必有肝脏"
+    },
+    {
+      "if_exists": "portal_vein_and_splenic_vein",
+      "must_exist": ["liver"],
+      "reason": "有门静脉必有肝脏"
+    },
+    {
+      "if_exists": "prostate",
+      "must_exist": ["urinary_bladder"],
+      "reason": "有前列腺必有膀胱"
+    },
+    {
+      "if_exists": "duodenum",
+      "must_exist": ["stomach"],
+      "reason": "有十二指肠通常有胃"
+    }
+  ],
+  
+  "spatial_constraints": [
+    {
+      "organ_pair": ["liver", "spleen"],
+      "rule": "spleen应在liver左侧",
+      "check_method": "centroid_x_comparison",
+      "tolerance": 0.1
+    },
+    {
+      "organ_pair": ["kidney_left", "kidney_right"],
+      "rule": "双肾应大致在同一水平",
+      "check_method": "centroid_z_distance",
+      "max_distance_slices": 20
+    }
+  ],
+  
+  "minimum_organ_count": {
+    "CHEST": 5,
+    "ABDOMEN": 3,
+    "PELVIS": 3,
+    "CHEST_ABDOMEN": 8,
+    "EXTREMITY": 1,
+    "HEAD": 2,
+    "UNKNOWN": 2
+  }
+}
