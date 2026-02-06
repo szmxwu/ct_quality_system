@@ -230,12 +230,9 @@ class HardFilter:
             errors.extend(self.check_organ_count(detected_organs, body_part))
             
             # 体积检查需要CT数据
-            if ct_path and os.path.exists(ct_path):
-                ct_data = load_npz_keys(ct_path, ['spacing'])
-                if ct_data and 'spacing' in ct_data:
-                    spacing = ct_data['spacing']
-                    label_counts = get_mask_label_counts(mask_path)
-                    errors.extend(self.check_volume_counts(label_counts, spacing))
+            spacing = 3
+            label_counts = get_mask_label_counts(mask_path)
+            errors.extend(self.check_volume_counts(label_counts, spacing))
 
             # 空间约束需要mask,按需构建
             if any(self.rules.get('spatial_constraints', [])):

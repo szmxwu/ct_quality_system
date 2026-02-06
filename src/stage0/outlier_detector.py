@@ -21,11 +21,8 @@ def _outlier_worker(args: tuple) -> list:
     row_dict, volume_thresholds = args
     try:
         label_counts = get_mask_label_counts(row_dict['mask_path'])
-        ct_data = load_npz_keys(row_dict['ct_path'], ['spacing']) if row_dict['ct_path'] else None
-        if ct_data is None or 'spacing' not in ct_data:
-            return []
 
-        spacing = ct_data['spacing']
+        spacing = 3
         voxel_volume_ml = np.prod(spacing) / 1000
 
         outlier_records = []

@@ -111,9 +111,7 @@ def _volume_worker(args: tuple) -> dict:
     mask_path, ct_path = args
     try:
         label_counts = get_mask_label_counts(mask_path)
-        # ct_data = load_npz_keys(ct_path, ['spacing']) if ct_path else None
-        # if ct_data is None:
-        #     return {}
+
 
         spacing = 3
         voxel_volume_ml = np.prod(spacing) / 1000
