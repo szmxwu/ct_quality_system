@@ -262,12 +262,15 @@ def generate_stage0_report(output_dir: str):
         for idx, row in body_part.iterrows():
             report += f"   {row['body_part']:15s}: {row['case_count']:6,} ({row['percentage']:5.1f}%)\n"
         
-        outlier_count = len(outliers)
-        outlier_rate = outlier_count / total_count * 100 if total_count > 0 else 0
+        outlier_record_count = len(outliers)
+        # 异常样本数 = 去重后的case数量
+        outlier_case_count = outliers['accession_number'].nunique() if not outliers.empty else 0
+        outlier_rate = outlier_case_count / total_count * 100 if total_count > 0 else 0
         
         report += f"""
 4. 初步异常检测
-   异常样本数: {outlier_count:,} ({outlier_rate:.2f}%)
+   异常记录数: {outlier_record_count:,}
+   异常样本数: {outlier_case_count:,} ({outlier_rate:.2f}%)
    
    按异常类型分布:
 """

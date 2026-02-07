@@ -137,11 +137,14 @@ def detect_outliers(file_index_path: str, organ_volumes_path: str,
     df_result = pd.DataFrame(outlier_records)
     
     # 统计
-    total_outliers = len(df_result)
-    outlier_rate = total_outliers / len(df_valid) * 100 if len(df_valid) > 0 else 0
+    total_outlier_records = len(df_result)
+    # 异常样本数 = 去重后的case数量
+    total_outlier_cases = df_result['accession_number'].nunique() if not df_result.empty else 0
+    outlier_rate = total_outlier_cases / len(df_valid) * 100 if len(df_valid) > 0 else 0
     
     logger.info("\n异常检测结果:")
-    logger.info(f"  异常样本数: {total_outliers:,}")
+    logger.info(f"  异常记录数: {total_outlier_records:,}")
+    logger.info(f"  异常样本数: {total_outlier_cases:,}")
     logger.info(f"  异常率: {outlier_rate:.2f}%")
     
     if not df_result.empty:
