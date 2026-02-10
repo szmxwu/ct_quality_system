@@ -85,7 +85,7 @@ def compute_boundary_score(ct_image: np.ndarray, mask: np.ndarray,
     try:
         # 提取边界voxels
         eroded = ndimage.binary_erosion(mask, iterations=1)
-        boundary = mask & ~eroded
+        boundary = (mask & ~eroded).astype(bool)
         
         if not boundary.any() or not eroded.any():
             return 1.0
@@ -121,7 +121,7 @@ def compute_boundary_score(ct_image: np.ndarray, mask: np.ndarray,
 
 def compute_connectivity_score(mask: np.ndarray) -> float:
     """
-    计算连通性分数
+    计算连通性分数 - 使用更快的ndimage.label
     
     Args:
         mask: 器官mask
@@ -130,19 +130,18 @@ def compute_connectivity_score(mask: np.ndarray) -> float:
         float: 连通性分数 (0-1)
     """
     try:
-        labels, num_components = measure.label(mask, return_num=True)
+        # 使用scipy.ndimage.label比skimage.measure.label快2-3倍
+        labels, num_components = ndimage.label(mask)
         
         if num_components == 0:
             return 0.0
         
-        # 计算每个连通分量的大小
-        component_sizes = []
-        for i in range(1, num_components + 1):
-            size = np.sum(labels == i)
-            component_sizes.append(size)
+        if num_components == 1:
+            return 1.0
         
-        # 最大连通分量占总体积的比例
-        largest_ratio = max(component_sizes) / sum(component_sizes)
+        # 使用bincount快速计算各连通分量大小
+        component_sizes = np.bincount(labels.ravel())[1:]  # 跳过背景0
+        largest_ratio = component_sizes.max() / component_sizes.sum()
         return largest_ratio
     
     except Exception as e:
@@ -281,7 +280,7 @@ def compute_overall_score(boundary_score: float, morphology_score: float,
 
 def score_case(mask_path: str, ct_path: str) -> list:
     """
-    为单个case的所有器官打分
+    为单个case的所有器官打分 - 优化版：缓存CT梯度
     
     Args:
         mask_path: mask文件路径
@@ -303,13 +302,18 @@ def score_case(mask_path: str, ct_path: str) -> list:
         
         ct_image = ct_data['image']
         
+        # 预计算CT梯度（所有器官共用）
+        gradient_magnitude = compute_gradient_magnitude(ct_image)
+        
         # 为每个器官打分
         for organ_name, mask in masks.items():
             try:
                 organ_label = LABEL_TO_ORGAN.get(organ_name, 0)
                 
-                # 计算各项分数
-                boundary_score = compute_boundary_score(ct_image, mask, organ_name)
+                # 计算各项分数 - 使用缓存的梯度
+                boundary_score = compute_boundary_score_with_gradient(
+                    ct_image, mask, organ_name, gradient_magnitude
+                )
                 morph_scores = compute_morphology_score(mask, organ_name)
                 hu_score = compute_hu_score(ct_image, mask, organ_name)
                 overall_score = compute_overall_score(
@@ -334,12 +338,60 @@ def score_case(mask_path: str, ct_path: str) -> list:
                 continue
         
         # 释放内存
-        del ct_data
+        del ct_data, gradient_magnitude
     
     except Exception as e:
         logger.warning(f"处理case失败 {mask_path}: {e}")
     
     return records
+
+
+def compute_boundary_score_with_gradient(ct_image: np.ndarray, mask: np.ndarray, 
+                                         organ_name: str, gradient_magnitude: np.ndarray) -> float:
+    """
+    计算边界质量分数 - 使用预计算的梯度
+    
+    Args:
+        ct_image: CT图像数组
+        mask: 器官mask
+        organ_name: 器官名称
+        gradient_magnitude: 预计算的梯度幅值
+    
+    Returns:
+        float: 边界分数 (0-1)
+    """
+    try:
+        # 提取边界voxels
+        eroded = ndimage.binary_erosion(mask, iterations=1)
+        boundary = (mask & ~eroded).astype(bool)
+        
+        if not boundary.any() or not eroded.any():
+            return 1.0
+        
+        # 使用预计算的梯度
+        boundary_gradient = gradient_magnitude[boundary]
+        interior_gradient = gradient_magnitude[eroded]
+        
+        if len(boundary_gradient) == 0 or len(interior_gradient) == 0:
+            return 1.0
+        
+        median_boundary = np.median(boundary_gradient)
+        median_interior = np.median(interior_gradient)
+        
+        gradient_ratio = median_boundary / (median_interior + 1e-6)
+        
+        # 根据器官类型选择期望值
+        organ_type = classify_organ_type(organ_name)
+        expected = EXPECTED_GRADIENT_RATIOS.get(organ_type, 1.5)
+        
+        # 归一化到0-1
+        boundary_score = min(gradient_ratio / expected, 1.0)
+        
+        return boundary_score
+    
+    except Exception as e:
+        logger.warning(f"计算边界分数失败 {organ_name}: {e}")
+        return 1.0
 
 
 def _score_case_worker(args: tuple) -> tuple:

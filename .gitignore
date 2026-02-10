@@ -6,3 +6,6 @@ venv/
 *.npz
 .DS_Store
 *.log
+*temp*.csv
+*.tmp
+*.bak

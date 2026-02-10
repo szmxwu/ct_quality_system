@@ -9,6 +9,9 @@ import pandas as pd
 from tqdm import tqdm
 import logging
 import multiprocessing as mp
+import signal
+import time
+from functools import wraps
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from match_data import get_mask_labels, get_mask_label_counts, get_npz_masks
@@ -34,13 +37,16 @@ class HardFilter:
         with open(rules_path, 'r') as f:
             self.rules = json.load(f)
         
-        # 加载体积阈值
+        # 加载体积阈值 - 使用p5/p95而非p1/p99，更宽松
         df_volumes = pd.read_csv(volume_stats_path)
         self.volume_thresholds = {}
         for idx, row in df_volumes.iterrows():
+            # 使用p5/p95，并添加10%容差
+            p05 = row['volume_p05_ml'] if 'volume_p05_ml' in row else row['volume_p01_ml']
+            p95 = row['volume_p95_ml'] if 'volume_p95_ml' in row else row['volume_p99_ml']
             self.volume_thresholds[row['organ_name']] = {
-                'min': row['volume_p01_ml'],
-                'max': row['volume_p99_ml']
+                'min': p05 * 0.9,   # p5减10%
+                'max': p95 * 1.1    # p95加10%
             }
         
         # logger.info(f"硬过滤器初始化完成")
@@ -110,7 +116,7 @@ class HardFilter:
     
     def check_volume_counts(self, label_counts: dict, spacing: np.ndarray) -> list:
         """
-        检查体积异常
+        检查体积异常 - 放宽阈值使用p5/p95，减少误判
         
         Args:
             masks: 器官mask字典
@@ -130,8 +136,15 @@ class HardFilter:
             
             volume_ml = count * voxel_volume_ml
             thresholds = self.volume_thresholds[organ_name]
-            min_vol = thresholds['min']
-            max_vol = thresholds['max']
+            
+            # 使用更宽松的阈值：p1/p99 -> p5/p95
+            # 异常值定义为超出5%-95%范围，而非1%-99%
+            min_vol = thresholds['min']  # p5
+            max_vol = thresholds['max']  # p95
+            
+            # 额外放宽：允许10%的容差
+            min_vol = min_vol * 0.9
+            max_vol = max_vol * 1.1
             
             if volume_ml < min_vol:
                 errors.append(f"volume_too_small:{organ_name}={volume_ml:.1f}<{min_vol:.1f}")
@@ -258,22 +271,234 @@ class HardFilter:
             }
 
 
+def _init_worker():
+    """子进程初始化函数 - 忽略SIGINT信号，让父进程处理"""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+class TimeoutError(Exception):
+    pass
+
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("处理超时")
+
+
+def _run_in_batches(work_items, rules_path, volume_stats_path, 
+                   output_path, reject_log_path, num_workers):
+    """
+    分批处理大量数据，每批结束后保存进度
+    避免单个进程池处理过多任务导致的问题
+    """
+    batch_size = 5000
+    total = len(work_items)
+    all_results = []
+    
+    logger.info(f"批处理模式: 总共 {total} 个任务, 每批 {batch_size} 个")
+    
+    for batch_start in range(0, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch = work_items[batch_start:batch_end]
+        
+        logger.info(f"处理批次 {batch_start//batch_size + 1}/{(total-1)//batch_size + 1}: {batch_start}-{batch_end}")
+        
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(processes=num_workers, initializer=_init_worker)
+        
+        batch_results = []
+        try:
+            # 使用imap_unordered流式处理
+            iterator = pool.imap_unordered(_hard_filter_worker, batch, chunksize=2)
+            
+            with tqdm(total=len(batch), desc=f"批次 {batch_start//batch_size + 1}") as pbar:
+                last_update = time.time()
+                
+                while len(batch_results) < len(batch):
+                    try:
+                        result = next(iterator)
+                        batch_results.append(result)
+                        pbar.update(1)
+                        last_update = time.time()
+                    except StopIteration:
+                        break
+                        
+        finally:
+            pool.close()
+            pool.join()
+        
+        all_results.extend(batch_results)
+        logger.info(f"批次完成: 获得 {len(batch_results)} 条结果，累计 {len(all_results)}/{total}")
+        
+        # 每批结束后保存中间结果
+        if output_path and batch_results:
+            temp_df = pd.DataFrame(all_results)
+            temp_path = output_path.replace('.csv', f'_temp_batch{batch_start//batch_size + 1}.csv')
+            temp_df.to_csv(temp_path, index=False)
+            logger.info(f"中间结果已保存: {temp_path}")
+    
+    logger.info(f"所有批次完成，总共 {len(all_results)} 条结果")
+    
+    # 删除临时文件
+    if output_path:
+        import glob
+        temp_pattern = output_path.replace('.csv', '_temp_batch*.csv')
+        temp_files = glob.glob(temp_pattern)
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+                logger.info(f"删除临时文件: {temp_file}")
+            except Exception as e:
+                logger.warning(f"删除临时文件失败 {temp_file}: {e}")
+    
+    # 处理拒绝记录
+    reject_records = []
+    for record in all_results:
+        if not record.get('passed_hard_filter', False):
+            for error in record.get('errors', '').split(';'):
+                if not error:
+                    continue
+                if ':' in error:
+                    error_type, error_detail = error.split(':', 1)
+                else:
+                    error_type = error
+                    error_detail = ''
+
+                severity = 'minor'
+                if 'missing_critical' in error_type or 'cooccurrence_violated' in error_type:
+                    severity = 'critical'
+                elif 'volume' in error_type:
+                    severity = 'major'
+                elif 'timeout' in error_type:
+                    severity = 'major'
+
+                reject_records.append({
+                    'accession_number': record['accession_number'],
+                    'series_number': record['series_number'],
+                    'error_type': error_type,
+                    'error_detail': error_detail,
+                    'severity': severity
+                })
+    
+    # 保存最终结果
+    df_result = pd.DataFrame(all_results)
+    
+    if output_path:
+        df_result.to_csv(output_path, index=False)
+        logger.info(f"过滤结果已保存: {output_path}")
+    
+    if reject_log_path and reject_records:
+        df_reject = pd.DataFrame(reject_records)
+        df_reject.to_csv(reject_log_path, index=False)
+        logger.info(f"拒绝日志已保存: {reject_log_path}")
+    
+    # 统计
+    total_cases = len(df_result)
+    passed = df_result['passed_hard_filter'].sum()
+    rejected = total_cases - passed
+    reject_rate = rejected / total_cases * 100 if total_cases > 0 else 0
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("过滤结果总览:")
+    logger.info(f"  处理总数: {total_cases:,}")
+    logger.info(f"  通过过滤: {passed:,} ({100-reject_rate:.1f}%)")
+    logger.info(f"  被拒绝: {rejected:,} ({reject_rate:.1f}%)")
+    
+    return df_result
+
+
+def with_timeout(seconds):
+    """装饰器：为函数添加超时机制"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 设置信号处理（仅Unix）
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+                signal.alarm(0)  # 取消定时器
+                return result
+            finally:
+                signal.signal(signal.SIGALRM, old_handler)
+        return wrapper
+    return decorator
+
+
 def _hard_filter_worker(args: tuple) -> dict:
+    """工作进程函数 - 使用spawn模式更安全，带超时和详细日志"""
     row_dict, rules_path, volume_stats_path = args
-    filter_obj = HardFilter(rules_path, volume_stats_path)
-    result = filter_obj.filter_case(row_dict['mask_path'], row_dict['ct_path'])
-    return {
-        'accession_number': row_dict['accession_number'],
-        'series_number': row_dict['series_number'],
-        'batch': row_dict['batch'],
-        'mask_path': row_dict['mask_path'],
-        'ct_path': row_dict['ct_path'],
-        'inferred_body_part': result['inferred_body_part'],
-        'detected_organ_count': result['detected_organ_count'],
-        'passed_hard_filter': result['passed'],
-        'error_count': result['error_count'],
-        'errors': result['errors']
-    }
+    mask_path = row_dict['mask_path']
+    accession = row_dict['accession_number']
+    
+    start_time = time.time()
+    
+    try:
+        # 每个文件30秒超时
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(30)
+        
+        filter_obj = HardFilter(rules_path, volume_stats_path)
+        
+        # 记录开始处理
+        sys.stderr.write(f"[START] {accession} - {os.path.basename(mask_path)}\n")
+        sys.stderr.flush()
+        
+        result = filter_obj.filter_case(mask_path, row_dict['ct_path'])
+        
+        # 取消定时器
+        signal.alarm(0)
+        
+        elapsed = time.time() - start_time
+        sys.stderr.write(f"[DONE] {accession} - {elapsed:.2f}s\n")
+        sys.stderr.flush()
+        
+        return {
+            'accession_number': accession,
+            'series_number': row_dict['series_number'],
+            'batch': row_dict['batch'],
+            'mask_path': mask_path,
+            'ct_path': row_dict['ct_path'],
+            'inferred_body_part': result['inferred_body_part'],
+            'detected_organ_count': result['detected_organ_count'],
+            'passed_hard_filter': result['passed'],
+            'error_count': result['error_count'],
+            'errors': result['errors'],
+            'process_time': elapsed
+        }
+    except TimeoutError as e:
+        elapsed = time.time() - start_time
+        sys.stderr.write(f"[TIMEOUT] {accession} - {elapsed:.2f}s\n")
+        sys.stderr.flush()
+        return {
+            'accession_number': accession,
+            'series_number': row_dict['series_number'],
+            'batch': row_dict['batch'],
+            'mask_path': mask_path,
+            'ct_path': row_dict['ct_path'],
+            'inferred_body_part': 'UNKNOWN',
+            'detected_organ_count': 0,
+            'passed_hard_filter': False,
+            'error_count': 1,
+            'errors': f'timeout:处理超过30秒',
+            'process_time': elapsed
+        }
+    except Exception as e:
+        elapsed = time.time() - start_time
+        sys.stderr.write(f"[ERROR] {accession} - {e} - {elapsed:.2f}s\n")
+        sys.stderr.flush()
+        return {
+            'accession_number': accession,
+            'series_number': row_dict['series_number'],
+            'batch': row_dict['batch'],
+            'mask_path': mask_path,
+            'ct_path': row_dict['ct_path'],
+            'inferred_body_part': 'UNKNOWN',
+            'detected_organ_count': 0,
+            'passed_hard_filter': False,
+            'error_count': 1,
+            'errors': f'worker_error:{str(e)}',
+            'process_time': elapsed
+        }
 
 
 def run_hard_filter(file_index_path: str, rules_path: str, volume_stats_path: str,
@@ -310,7 +535,6 @@ def run_hard_filter(file_index_path: str, rules_path: str, volume_stats_path: st
     
     # 处理每个case
     results = []
-    reject_records = []
 
     if num_workers is None:
         num_workers = max(1, min(4, mp.cpu_count() - 1))
@@ -319,35 +543,88 @@ def run_hard_filter(file_index_path: str, rules_path: str, volume_stats_path: st
     for _, row in df_valid.iterrows():
         work_items.append((row.to_dict(), rules_path, volume_stats_path))
 
-    with mp.get_context("fork").Pool(processes=num_workers) as pool:
-        for record in tqdm(pool.imap_unordered(_hard_filter_worker, work_items, chunksize=chunksize),
-                           total=len(work_items), desc="执行硬过滤"):
-            results.append(record)
+    logger.info(f"启动多进程处理: {num_workers} workers, chunksize={chunksize}")
+    
+    # 根据样本数自动选择模式
+    # 如果样本数很大(>10000)，使用批处理模式避免多进程问题
+    if len(work_items) > 10000:
+        logger.info(f"大样本量({len(work_items)}), 使用批处理模式")
+        return _run_in_batches(work_items, rules_path, volume_stats_path, 
+                               output_path, reject_log_path, num_workers)
+    
+    logger.info(f"使用 'spawn' 模式避免 fork 死锁问题")
 
-            # 记录拒绝详情
-            if not record['passed_hard_filter']:
-                for error in record['errors'].split(';'):
-                    if ':' in error:
-                        error_type, error_detail = error.split(':', 1)
-                    else:
-                        error_type = error
-                        error_detail = ''
+    # 使用 spawn 模式创建进程池
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=num_workers, initializer=_init_worker)
+    
+    results = []
+    
+    try:
+        # 使用imap_unordered流式处理，可以更好地处理异常
+        iterator = pool.imap_unordered(_hard_filter_worker, work_items, chunksize=chunksize)
+        
+        with tqdm(total=len(work_items), desc="执行硬过滤") as pbar:
+            last_update_time = time.time()
+            last_count = 0
+            
+            while len(results) < len(work_items):
+                try:
+                    result = next(iterator)
+                    results.append(result)
+                    pbar.update(1)
+                    last_update_time = time.time()
+                    last_count = len(results)
+                except StopIteration:
+                    break
+                except Exception as e:
+                    logger.error(f"处理任务出错: {e}")
+                    pbar.update(1)
+                    
+    except KeyboardInterrupt:
+        logger.warning("收到中断信号...")
+        pool.terminate()
+        raise
+    finally:
+        pool.close()
+        pool.join()
+    
+    # 小样本模式：处理拒绝记录
+    return _process_results(results, output_path, reject_log_path)
 
-                    # 判断严重度
-                    if 'missing_critical' in error_type or 'cooccurrence_violated' in error_type:
-                        severity = 'critical'
-                    elif 'volume' in error_type:
-                        severity = 'major'
-                    else:
-                        severity = 'minor'
 
-                    reject_records.append({
-                        'accession_number': record['accession_number'],
-                        'series_number': record['series_number'],
-                        'error_type': error_type,
-                        'error_detail': error_detail,
-                        'severity': severity
-                    })
+def _process_results(results, output_path, reject_log_path):
+    """处理结果并生成报告"""
+    # 处理拒绝记录
+    reject_records = []
+    for record in results:
+        if not record.get('passed_hard_filter', False):
+            for error in record.get('errors', '').split(';'):
+                if not error:
+                    continue
+                if ':' in error:
+                    error_type, error_detail = error.split(':', 1)
+                else:
+                    error_type = error
+                    error_detail = ''
+
+                # 判断严重度
+                if 'missing_critical' in error_type or 'cooccurrence_violated' in error_type:
+                    severity = 'critical'
+                elif 'volume' in error_type:
+                    severity = 'major'
+                elif 'timeout' in error_type:
+                    severity = 'major'
+                else:
+                    severity = 'minor'
+
+                reject_records.append({
+                    'accession_number': record['accession_number'],
+                    'series_number': record['series_number'],
+                    'error_type': error_type,
+                    'error_detail': error_detail,
+                    'severity': severity
+                })
     
     df_result = pd.DataFrame(results)
     

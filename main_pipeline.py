@@ -316,9 +316,11 @@ def generate_stage1_report(output_dir: str):
    通过过滤: {passed:,} ({100-reject_rate:.1f}%)
    被拒绝: {rejected:,} ({reject_rate:.1f}%)
 
-2. 拒绝原因分布
+2. 拒绝原因分布 (按去重case统计)
 """
-        error_type_counts = reject_log['error_type'].value_counts()
+        # 按case去重统计拒绝原因
+        case_error_types = reject_log.drop_duplicates(subset=['accession_number', 'series_number', 'error_type'])
+        error_type_counts = case_error_types['error_type'].value_counts()
         for error_type, count in error_type_counts.head(10).items():
             percentage = count / rejected * 100 if rejected > 0 else 0
             report += f"   {error_type}: {count:,} ({percentage:.1f}%)\n"
