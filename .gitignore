@@ -9,3 +9,4 @@ venv/
 *temp*.csv
 *.tmp
 *.bak
+AGENTS.md
