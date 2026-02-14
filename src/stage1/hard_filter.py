@@ -306,24 +306,81 @@ def _run_in_batches(work_items, rules_path, volume_stats_path,
         pool = ctx.Pool(processes=num_workers, initializer=_init_worker)
         
         batch_results = []
+        failed_count = 0
         try:
-            # 使用imap_unordered流式处理
-            iterator = pool.imap_unordered(_hard_filter_worker, batch, chunksize=2)
+            # 使用apply_async提交任务，可以更好地控制超时
+            async_results = []
+            for item in batch:
+                async_results.append(pool.apply_async(_hard_filter_worker, (item,)))
             
             with tqdm(total=len(batch), desc=f"批次 {batch_start//batch_size + 1}") as pbar:
+                pending = list(enumerate(async_results))
                 last_update = time.time()
                 
-                while len(batch_results) < len(batch):
-                    try:
-                        result = next(iterator)
-                        batch_results.append(result)
-                        pbar.update(1)
-                        last_update = time.time()
-                    except StopIteration:
-                        break
+                while pending:
+                    # 检查是否有完成的任务
+                    still_pending = []
+                    for idx, async_res in pending:
+                        if async_res.ready():
+                            try:
+                                result = async_res.get(timeout=0.1)
+                                batch_results.append(result)
+                                pbar.update(1)
+                                last_update = time.time()
+                            except Exception as e:
+                                logger.warning(f"任务返回错误: {e}")
+                                failed_count += 1
+                                pbar.update(1)
+                        else:
+                            still_pending.append((idx, async_res))
+                    
+                    pending = still_pending
+                    
+                    # 检查超时
+                    if time.time() - last_update > 120:  # 2分钟无进展
+                        logger.warning(f"批次 {batch_start//batch_size + 1} 处理缓慢，剩余 {len(pending)} 个任务")
+                        # 尝试获取剩余任务，设置短超时
+                        for idx, async_res in pending[:]:
+                            try:
+                                result = async_res.get(timeout=5)
+                                batch_results.append(result)
+                                pbar.update(1)
+                                pending.remove((idx, async_res))
+                                last_update = time.time()
+                            except mp.TimeoutError:
+                                logger.warning(f"任务 {idx} 超时，跳过")
+                                failed_count += 1
+                                pbar.update(1)
+                                pending.remove((idx, async_res))
+                            except Exception as e:
+                                logger.warning(f"任务 {idx} 错误: {e}")
+                                failed_count += 1
+                                pbar.update(1)
+                                pending.remove((idx, async_res))
+                    
+                    if pending:
+                        time.sleep(0.1)  # 短暂休眠避免CPU占用过高
                         
         finally:
-            pool.close()
+            # 强制终止所有进程
+            pool.terminate()
+            
+            # 使用超时机制等待进程结束，避免永远卡死
+            # 等待最多10秒，如果进程仍未结束则继续
+            wait_start = time.time()
+            while time.time() - wait_start < 10:
+                if not any(p.is_alive() for p in pool._pool):
+                    break
+                time.sleep(0.1)
+            
+            # 如果仍有进程存活，强制kill（在Unix系统上）
+            for p in pool._pool:
+                if p.is_alive():
+                    try:
+                        os.kill(p.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            
             pool.join()
         
         all_results.extend(batch_results)
