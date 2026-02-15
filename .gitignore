@@ -1,4 +1,10 @@
+outputs/
+.DS_Store
 __pycache__/
+*.pyc
+.venv/
+env/
+*.egg-info/__pycache__/
 *.pyc
 .env
 venv/
